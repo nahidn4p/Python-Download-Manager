@@ -310,3 +310,44 @@ class DownloadTask:
 
     def is_alive(self):
         return self._worker_thread is not None and self._worker_thread.is_alive()
+    
+    # -------------------------
+    # Serialization for persistence
+    # -------------------------
+    def to_dict(self):
+        """Convert task to dictionary for saving."""
+        return {
+            'url': self.url,
+            'dest_folder': self.dest_folder,
+            'threads': self.threads,
+            'filename': self.filename,
+            'total_size': self.total_size,
+            'downloaded': self.downloaded,
+            'status': self.status,
+            'error': self.error,
+            'temp_root': self.temp_root,
+        }
+    
+    @classmethod
+    def from_dict(cls, data):
+        """Create task from dictionary."""
+        task = cls(
+            url=data['url'],
+            dest_folder=data['dest_folder'],
+            threads=data.get('threads', 4),
+            temp_root=data.get('temp_root', 'data/temp')
+        )
+        task.total_size = data.get('total_size', 0)
+        task.downloaded = data.get('downloaded', 0)
+        task.status = data.get('status', 'paused')
+        task.error = data.get('error')
+        
+        # Restore downloaded count from existing part files
+        if os.path.exists(task.task_temp):
+            task.downloaded = 0
+            for f in os.listdir(task.task_temp):
+                fp = os.path.join(task.task_temp, f)
+                if os.path.isfile(fp):
+                    task.downloaded += os.path.getsize(fp)
+        
+        return task

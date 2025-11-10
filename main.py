@@ -1,6 +1,7 @@
 # main.py
 import sys
 import os
+import json
 import threading
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout,
@@ -11,6 +12,7 @@ from PyQt6.QtCore import QTimer, Qt
 from downloader import DownloadTask
 
 DEFAULT_THREADS_PER_TASK = 4
+PERSISTENCE_FILE = "data/downloads.json"
 
 
 class IDMWindow(QWidget):
@@ -80,6 +82,9 @@ class IDMWindow(QWidget):
         self.timer.setInterval(300)
         self.timer.timeout.connect(self.refresh_table)
         self.timer.start()
+        
+        # Load previous incomplete downloads
+        self.load_tasks()
 
     # ------------------ GUI callbacks ------------------
     def choose_folder(self):
@@ -106,6 +111,7 @@ class IDMWindow(QWidget):
         self.tasks.append(task)
         self._add_table_row(task)
         self.log(f"[Added] {task.filename}")
+        self.save_tasks()  # Save after adding
 
     def _add_table_row(self, task):
         row = self.table.rowCount()
@@ -121,7 +127,13 @@ class IDMWindow(QWidget):
 
         # progress bar
         progress_bar = QProgressBar()
-        progress_bar.setValue(0)
+        progress_bar.setMaximum(100)
+        # Set initial progress if task has progress
+        if task.total_size and task.total_size > 0:
+            percent = int((task.downloaded / task.total_size) * 100)
+            progress_bar.setValue(percent)
+        else:
+            progress_bar.setValue(0)
         self.table.setCellWidget(row, 2, progress_bar)
 
         # status
@@ -156,6 +168,7 @@ class IDMWindow(QWidget):
         self.table.setCellWidget(row, 5, action_widget)
 
     def refresh_table(self):
+        needs_save = False
         for idx, task in enumerate(list(self.tasks)):
             if idx >= self.table.rowCount():
                 continue
@@ -175,12 +188,21 @@ class IDMWindow(QWidget):
                 # crude approximation if unknown size
                 progress_widget.setValue(min(downloaded * 100 // 1024 // 1024, 100))
 
+            old_status = status_item.text()
             status_item.setText(task.status)
             speed_item.setText(self._format_speed(task.speed_bps))
+            
+            # Save if status changed
+            if old_status != task.status:
+                needs_save = True
 
             # log errors automatically
             if task.status == "error" and task.error:
                 self.log(f"[ERROR] {task.filename}: {task.error}")
+        
+        # Periodically save tasks (every 30 refreshes ~ 9 seconds)
+        if needs_save:
+            self.save_tasks()
 
     def _format_speed(self, bps):
         if bps is None or bps <= 0:
@@ -238,6 +260,7 @@ class IDMWindow(QWidget):
         for i in range(self.table.rowCount()):
             self.table.item(i, 0).setText(str(i + 1))
         self.log(f"[Removed] {task.filename}")
+        self.save_tasks()  # Save after removing
 
     # ------------------ Batch actions ------------------
     def start_all(self):
@@ -262,11 +285,75 @@ class IDMWindow(QWidget):
                 i += 1
         for r in range(self.table.rowCount()):
             self.table.item(r, 0).setText(str(r + 1))
+        self.save_tasks()  # Save after clearing
 
     # ------------------ Logging ------------------
     def log(self, msg):
         self.log_box.append(msg)
         print(msg)
+    
+    # ------------------ Persistence ------------------
+    def save_tasks(self):
+        """Save incomplete tasks to file."""
+        try:
+            os.makedirs(os.path.dirname(PERSISTENCE_FILE), exist_ok=True)
+            tasks_data = []
+            for task in self.tasks:
+                # Only save incomplete tasks
+                if task.status not in ("completed",):
+                    tasks_data.append(task.to_dict())
+            
+            with open(PERSISTENCE_FILE, 'w') as f:
+                json.dump(tasks_data, f, indent=2)
+        except Exception as e:
+            print(f"Error saving tasks: {e}")
+    
+    def load_tasks(self):
+        """Load incomplete tasks from file."""
+        try:
+            if not os.path.exists(PERSISTENCE_FILE):
+                return
+            
+            with open(PERSISTENCE_FILE, 'r') as f:
+                tasks_data = json.load(f)
+            
+            loaded_count = 0
+            for task_data in tasks_data:
+                try:
+                    # Check if temp directory still exists (partial files)
+                    temp_dir = os.path.join(
+                        task_data.get('temp_root', 'data/temp'),
+                        f"{task_data['filename']}.parts"
+                    )
+                    
+                    # Only restore if temp directory exists (has partial files) or file doesn't exist
+                    dest_path = os.path.join(task_data['dest_folder'], task_data['filename'])
+                    # Check if file is already complete
+                    file_complete = False
+                    if os.path.exists(dest_path):
+                        file_size = os.path.getsize(dest_path)
+                        total_size = task_data.get('total_size', 0)
+                        if total_size > 0 and file_size >= total_size:
+                            file_complete = True
+                    
+                    if not file_complete and (os.path.exists(temp_dir) or not os.path.exists(dest_path)):
+                        task = DownloadTask.from_dict(task_data)
+                        self.tasks.append(task)
+                        self._add_table_row(task)
+                        loaded_count += 1
+                        self.log(f"[Restored] {task.filename} ({task.status})")
+                except Exception as e:
+                    print(f"Error loading task {task_data.get('filename', 'unknown')}: {e}")
+            
+            if loaded_count > 0:
+                self.log(f"[Loaded] {loaded_count} incomplete download(s)")
+        except Exception as e:
+            print(f"Error loading tasks: {e}")
+    
+    def closeEvent(self, event):
+        """Called when window is closed."""
+        self.save_tasks()
+        event.accept()
 
 
 if __name__ == "__main__":
