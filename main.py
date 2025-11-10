@@ -1,7 +1,7 @@
 # main.py
 import sys
 import os
-import json
+import sqlite3
 import threading
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout,
@@ -12,7 +12,7 @@ from PyQt6.QtCore import QTimer, Qt
 from downloader import DownloadTask
 
 DEFAULT_THREADS_PER_TASK = 4
-PERSISTENCE_FILE = "data/downloads.json"
+DB_FILE = "data/downloads.db"
 
 
 class IDMWindow(QWidget):
@@ -83,6 +83,9 @@ class IDMWindow(QWidget):
         self.timer.timeout.connect(self.refresh_table)
         self.timer.start()
         
+        # Initialize database
+        self.init_database()
+        
         # Load previous incomplete downloads
         self.load_tasks()
 
@@ -111,7 +114,7 @@ class IDMWindow(QWidget):
         self.tasks.append(task)
         self._add_table_row(task)
         self.log(f"[Added] {task.filename}")
-        self.save_tasks()  # Save after adding
+        self.save_task(task)  # Save after adding
 
     def _add_table_row(self, task):
         row = self.table.rowCount()
@@ -169,6 +172,7 @@ class IDMWindow(QWidget):
 
     def refresh_table(self):
         needs_save = False
+        tasks_to_save = []
         for idx, task in enumerate(list(self.tasks)):
             if idx >= self.table.rowCount():
                 continue
@@ -192,17 +196,20 @@ class IDMWindow(QWidget):
             status_item.setText(task.status)
             speed_item.setText(self._format_speed(task.speed_bps))
             
-            # Save if status changed
-            if old_status != task.status:
+            # Save if status changed or task is incomplete
+            if old_status != task.status or task.status != "completed":
                 needs_save = True
+                if task.status != "completed":
+                    tasks_to_save.append(task)
 
             # log errors automatically
             if task.status == "error" and task.error:
                 self.log(f"[ERROR] {task.filename}: {task.error}")
         
-        # Periodically save tasks (every 30 refreshes ~ 9 seconds)
+        # Save tasks that need updating (more efficient than saving all)
         if needs_save:
-            self.save_tasks()
+            for task in tasks_to_save:
+                self.save_task(task)
 
     def _format_speed(self, bps):
         if bps is None or bps <= 0:
@@ -254,13 +261,13 @@ class IDMWindow(QWidget):
             shutil.rmtree(task.task_temp, ignore_errors=True)
         except Exception:
             pass
+        self.delete_task(task.url, task.dest_folder)  # Remove from database
         self.table.removeRow(row)
         self.tasks.pop(row)
         # update IDs
         for i in range(self.table.rowCount()):
             self.table.item(i, 0).setText(str(i + 1))
         self.log(f"[Removed] {task.filename}")
-        self.save_tasks()  # Save after removing
 
     # ------------------ Batch actions ------------------
     def start_all(self):
@@ -293,57 +300,216 @@ class IDMWindow(QWidget):
         print(msg)
     
     # ------------------ Persistence ------------------
-    def save_tasks(self):
-        """Save incomplete tasks to file."""
+    def init_database(self):
+        """Initialize SQLite database and create table if it doesn't exist."""
         try:
-            os.makedirs(os.path.dirname(PERSISTENCE_FILE), exist_ok=True)
-            tasks_data = []
+            os.makedirs(os.path.dirname(DB_FILE), exist_ok=True)
+            conn = sqlite3.connect(DB_FILE)
+            cursor = conn.cursor()
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS downloads (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    url TEXT NOT NULL,
+                    dest_folder TEXT NOT NULL,
+                    filename TEXT NOT NULL,
+                    threads INTEGER DEFAULT 4,
+                    total_size INTEGER DEFAULT 0,
+                    downloaded INTEGER DEFAULT 0,
+                    status TEXT DEFAULT 'queued',
+                    error TEXT,
+                    temp_root TEXT DEFAULT 'data/temp',
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(url, dest_folder)
+                )
+            ''')
+            conn.commit()
+            conn.close()
+            
+            # Migrate from JSON if it exists
+            self.migrate_from_json()
+        except Exception as e:
+            print(f"Error initializing database: {e}")
+    
+    def migrate_from_json(self):
+        """Migrate data from JSON file to SQLite if JSON exists and DB is empty."""
+        try:
+            json_file = "data/downloads.json"
+            if not os.path.exists(json_file):
+                return
+            
+            # Check if database already has data
+            conn = self.get_db_connection()
+            cursor = conn.cursor()
+            cursor.execute('SELECT COUNT(*) FROM downloads')
+            count = cursor.fetchone()[0]
+            conn.close()
+            
+            if count > 0:
+                # Database already has data, skip migration
+                return
+            
+            # Read JSON and migrate
+            import json
+            with open(json_file, 'r') as f:
+                tasks_data = json.load(f)
+            
+            migrated = 0
+            for task_data in tasks_data:
+                try:
+                    # Only migrate incomplete tasks
+                    if task_data.get('status') != 'completed':
+                        task = DownloadTask.from_dict(task_data)
+                        self.save_task(task)
+                        migrated += 1
+                except Exception as e:
+                    print(f"Error migrating task: {e}")
+            
+            if migrated > 0:
+                print(f"Migrated {migrated} tasks from JSON to SQLite")
+                # Optionally backup or remove JSON file
+                # os.rename(json_file, json_file + ".backup")
+        except Exception as e:
+            print(f"Error migrating from JSON: {e}")
+    
+    def get_db_connection(self):
+        """Get database connection."""
+        return sqlite3.connect(DB_FILE)
+    
+    def save_task(self, task):
+        """Save or update a single task in database."""
+        try:
+            conn = self.get_db_connection()
+            cursor = conn.cursor()
+            
+            # Check if task exists
+            cursor.execute('SELECT id FROM downloads WHERE url = ? AND dest_folder = ?', 
+                         (task.url, task.dest_folder))
+            existing = cursor.fetchone()
+            
+            task_dict = task.to_dict()
+            if existing:
+                # Update existing task
+                cursor.execute('''
+                    UPDATE downloads 
+                    SET filename = ?, threads = ?, total_size = ?, downloaded = ?, 
+                        status = ?, error = ?, temp_root = ?, updated_at = CURRENT_TIMESTAMP
+                    WHERE url = ? AND dest_folder = ?
+                ''', (
+                    task_dict['filename'],
+                    task_dict['threads'],
+                    task_dict['total_size'],
+                    task_dict['downloaded'],
+                    task_dict['status'],
+                    task_dict['error'],
+                    task_dict['temp_root'],
+                    task.url,
+                    task.dest_folder
+                ))
+            else:
+                # Insert new task
+                cursor.execute('''
+                    INSERT INTO downloads 
+                    (url, dest_folder, filename, threads, total_size, downloaded, status, error, temp_root)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ''', (
+                    task_dict['url'],
+                    task_dict['dest_folder'],
+                    task_dict['filename'],
+                    task_dict['threads'],
+                    task_dict['total_size'],
+                    task_dict['downloaded'],
+                    task_dict['status'],
+                    task_dict['error'],
+                    task_dict['temp_root']
+                ))
+            
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            print(f"Error saving task: {e}")
+    
+    def delete_task(self, url, dest_folder):
+        """Delete a task from database."""
+        try:
+            conn = self.get_db_connection()
+            cursor = conn.cursor()
+            cursor.execute('DELETE FROM downloads WHERE url = ? AND dest_folder = ?', 
+                         (url, dest_folder))
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            print(f"Error deleting task: {e}")
+    
+    def save_tasks(self):
+        """Save all incomplete tasks to database."""
+        try:
             for task in self.tasks:
                 # Only save incomplete tasks
                 if task.status not in ("completed",):
-                    tasks_data.append(task.to_dict())
-            
-            with open(PERSISTENCE_FILE, 'w') as f:
-                json.dump(tasks_data, f, indent=2)
+                    self.save_task(task)
+                else:
+                    # Remove completed tasks from database
+                    self.delete_task(task.url, task.dest_folder)
         except Exception as e:
             print(f"Error saving tasks: {e}")
     
     def load_tasks(self):
-        """Load incomplete tasks from file."""
+        """Load incomplete tasks from database."""
         try:
-            if not os.path.exists(PERSISTENCE_FILE):
-                return
-            
-            with open(PERSISTENCE_FILE, 'r') as f:
-                tasks_data = json.load(f)
+            conn = self.get_db_connection()
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT url, dest_folder, filename, threads, total_size, downloaded, 
+                       status, error, temp_root
+                FROM downloads
+                WHERE status != 'completed'
+                ORDER BY created_at DESC
+            ''')
+            rows = cursor.fetchall()
+            conn.close()
             
             loaded_count = 0
-            for task_data in tasks_data:
+            for row in rows:
                 try:
+                    url, dest_folder, filename, threads, total_size, downloaded, status, error, temp_root = row
+                    
                     # Check if temp directory still exists (partial files)
-                    temp_dir = os.path.join(
-                        task_data.get('temp_root', 'data/temp'),
-                        f"{task_data['filename']}.parts"
-                    )
+                    temp_dir = os.path.join(temp_root or 'data/temp', f"{filename}.parts")
                     
                     # Only restore if temp directory exists (has partial files) or file doesn't exist
-                    dest_path = os.path.join(task_data['dest_folder'], task_data['filename'])
+                    dest_path = os.path.join(dest_folder, filename)
                     # Check if file is already complete
                     file_complete = False
                     if os.path.exists(dest_path):
                         file_size = os.path.getsize(dest_path)
-                        total_size = task_data.get('total_size', 0)
                         if total_size > 0 and file_size >= total_size:
                             file_complete = True
                     
                     if not file_complete and (os.path.exists(temp_dir) or not os.path.exists(dest_path)):
+                        task_data = {
+                            'url': url,
+                            'dest_folder': dest_folder,
+                            'filename': filename,
+                            'threads': threads,
+                            'total_size': total_size,
+                            'downloaded': downloaded,
+                            'status': status,
+                            'error': error,
+                            'temp_root': temp_root or 'data/temp'
+                        }
                         task = DownloadTask.from_dict(task_data)
                         self.tasks.append(task)
                         self._add_table_row(task)
                         loaded_count += 1
-                        self.log(f"[Restored] {task.filename} ({task.status})")
+                        # Log with progress percentage
+                        if task.total_size > 0:
+                            percent = (task.downloaded / task.total_size) * 100
+                            self.log(f"[Restored] {task.filename} ({task.status}) - {percent:.1f}%")
+                        else:
+                            self.log(f"[Restored] {task.filename} ({task.status})")
                 except Exception as e:
-                    print(f"Error loading task {task_data.get('filename', 'unknown')}: {e}")
+                    print(f"Error loading task {row[2] if len(row) > 2 else 'unknown'}: {e}")
             
             if loaded_count > 0:
                 self.log(f"[Loaded] {loaded_count} incomplete download(s)")

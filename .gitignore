@@ -15,3 +15,5 @@ __pycache__
 data/
 *.parts/
 downloads.json
+downloads.db
+*.db

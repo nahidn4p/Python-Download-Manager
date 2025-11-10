@@ -204,19 +204,29 @@ class DownloadTask:
         self._stop_event.clear()
 
         try:
+            # Calculate downloaded count from existing part files FIRST (before getting file info)
+            # This preserves progress when resuming
+            self.downloaded = 0
+            if os.path.exists(self.task_temp):
+                for f in os.listdir(self.task_temp):
+                    fp = os.path.join(self.task_temp, f)
+                    if os.path.isfile(fp):
+                        self.downloaded += os.path.getsize(fp)
+            
+            # Get file info from server
             supports_range, total = self.supports_range_and_size()
             if total is None:
                 total = 0
-            self.total_size = total
+            
+            # Preserve existing total_size if we have one (from restore), otherwise use server value
+            if self.total_size > 0 and total > 0:
+                # Use the larger value (in case file was updated)
+                self.total_size = max(self.total_size, total)
+            elif total > 0:
+                self.total_size = total
+            # If total is 0, keep existing total_size if we have one
 
-            # reset downloaded count by summing existing part files (so resume works)
-            self.downloaded = 0
-            for f in os.listdir(self.task_temp):
-                fp = os.path.join(self.task_temp, f)
-                if os.path.isfile(fp):
-                    self.downloaded += os.path.getsize(fp)
-
-            if not supports_range or total == 0:
+            if not supports_range or self.total_size == 0:
                 # fallback single-stream (no range)
                 self.status = "downloading"
                 self._single_stream_download(self.dest_path)
@@ -227,14 +237,14 @@ class DownloadTask:
                 return
 
             # segmented download
-            part_size = math.ceil(total / self.threads)
+            part_size = math.ceil(self.total_size / self.threads)
             parts = []
             threads = []
 
             # start per-part threads
             for i in range(self.threads):
                 start = i * part_size
-                end = min(start + part_size - 1, total - 1)
+                end = min(start + part_size - 1, self.total_size - 1)
                 part_path = os.path.join(self.task_temp, f"part_{i}.tmp")
                 parts.append(part_path)
                 # If part already exists and size matches expected, skip thread
