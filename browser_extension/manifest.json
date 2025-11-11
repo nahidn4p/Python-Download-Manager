@@ -1,0 +1,24 @@
+{
+  "manifest_version": 3,
+  "name": "PyIDM Bridge",
+  "description": "Redirect browser downloads into the local PyIDM desktop app.",
+  "version": "0.1.0",
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_title": "Download with PyIDM"
+  },
+  "permissions": [
+    "downloads",
+    "storage",
+    "contextMenus",
+    "notifications",
+    "tabs",
+    "webRequest"
+  ],
+  "host_permissions": [
+    "<all_urls>"
+  ]
+}
+
